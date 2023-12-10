@@ -4,7 +4,8 @@
 
 ## Trying it out
 
-Do you want to see the power of Appsync real-time data? [Test this application](https://chat.matthands.co.uk)
+Do you want to see the power of Appsync real-time data?
+<https://chat.matthands.co.uk>
 
 ## Setup
 
