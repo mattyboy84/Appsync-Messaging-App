@@ -1,0 +1,18 @@
+{
+  "name": "Appsync-Messaing-App-Functions",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@aws-sdk/client-dax": "^3.398.0",
+    "@aws-sdk/client-dynamodb": "^3.398.0",
+    "@aws-sdk/client-eventbridge": "^3.445.0",
+    "@aws-sdk/lib-dynamodb": "^3.398.0",
+    "amazon-dax-client": "^1.2.9"
+  },
+  "devDependencies": {
+    "eslint": "^8.36.0",
+    "eslint-config-airbnb": "^19.0.4",
+    "eslint-plugin-import": "^2.27.5",
+    "eslint-plugin-jsx-a11y": "^6.7.1"
+  }
+}

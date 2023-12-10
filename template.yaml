@@ -1,0 +1,428 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  AmplifyAppRepoURL:
+    Type: String
+    Description: Gitlab repository url of the amplify app # not .git
+    Default: ''
+  AmplifyAppRepoBranch:
+    Type: String
+    Description: Gitlab repository branch tha the amplify app was deployed to
+    Default: ''
+  AmplifyAppRepoToken:
+    Type: String
+    Description: Gitlab repository token of the amplify app
+    Default: ''
+##########################
+#### DOMAIN RESOURCES ####
+##########################
+  Domain:
+    Type: String
+    Description: Domain to create subdomains under
+    Default: ''
+  hostedZoneId:
+    Type: String
+    Description: Id of the doamin hosted zone. - leave blank to omit
+    Default: ''
+  DomainCert:
+    Type: String
+    Description: cert of the domain
+    Default: ''
+  DomainPrefix:
+    Type: String
+    Description: optional sub-domain
+    Default: 'chat' # can be made of lowercase letters, numbers or -
+##########################
+  LambdaTimeout:
+    Type: Number
+    Default: 900
+##########################
+  IncludeWAF:
+    Type: String
+    Default: 'No'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+
+Conditions:
+  IsDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref Domain, '']]
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref DomainCert, '']]
+  
+  IsSubDomainConfigured:
+    !And
+      - !Not [!Equals [!Ref Domain, '']]
+      - !Not [!Equals [!Ref hostedZoneId, '']]
+      - !Not [!Equals [!Ref DomainCert, '']]
+      - !Not [!Equals [!Ref DomainPrefix, '']]
+  
+  IsWafConfigured: !Equals [!Ref IncludeWAF, 'Yes']
+
+Globals:
+  Function:
+    CodeUri: ./
+    Runtime: nodejs20.x
+    MemorySize: 3008
+    Timeout: !Ref LambdaTimeout
+
+Resources:
+###################
+#### IAM ROLES ####
+###################
+  AmplifyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-AmplifyFunctionRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - amplify.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "${AWS::StackName}-amplify-role-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "amplify:*"
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess-Amplify"
+  
+  lambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-lambdaRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  
+  APIloggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-APIloggingRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs"
+  
+  dynamoStoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-dynamoStoreRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+  
+###########################
+#### AMPLIFY RESOURCES ####
+###########################
+  
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub "${AWS::StackName}-Amplify-app"
+      Description: description
+      Repository: !Ref AmplifyAppRepoURL
+      AccessToken: !Ref AmplifyAppRepoToken
+      Platform:  WEB_COMPUTE
+      EnableBranchAutoDeletion: true
+      IAMServiceRole: !Ref AmplifyFunctionRole
+      EnvironmentVariables: #These are injected into the BuildSepc environment
+        - Name: API_URL
+          Value: !If [IsDomainConfigured, !Sub 'https://${GraphQLApiDomain.DomainName}/graphql', !GetAtt GraphQLApi.GraphQLUrl]
+      #BuildSpec can optionally be amplify.yml at the root of project
+      BuildSpec: !Sub |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - echo "AWS_REGION=${AWS::Region}" >> .env
+                - cat .env
+                - |
+                  cat << EOF > aws-exports.js
+                  /* eslint-disable spaced-comment */
+                  /* eslint-disable quotes */
+                  /* eslint-disable quote-props */
+                  const awsmobile = {
+                    "aws_project_region": "${AWS::Region}",
+                    "aws_appsync_region": "${AWS::Region}",
+                    "aws_appsync_graphqlEndpoint": "$API_URL",
+                    "aws_appsync_authenticationType": "AWS_LAMBDA",
+                  };
+                  export default awsmobile;
+                  EOF
+                - cat aws-exports.js
+                - rm -f .eslintrc.json
+                - rm -f .eslintrc.json
+                - npm run build
+          artifacts:
+            baseDirectory: .next
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+  
+  AmplifyAppDomain:
+    Type: AWS::Amplify::Domain
+    Condition: IsDomainConfigured
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      DomainName: !Ref Domain
+      EnableAutoSubDomain: false
+      SubDomainSettings:
+        - BranchName: !Ref AmplifyAppRepoBranch
+          Prefix: !If [IsSubDomainConfigured, !Ref DomainPrefix, '']
+    DependsOn:
+      - AmplifyBranch
+  
+  AmplifyAppLogGroup: #amplify would auto create this log group
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/amplify/', !GetAtt AmplifyApp.AppId]]
+  
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      BranchName: !Ref AmplifyAppRepoBranch
+      Description: branch description
+      AppId: !GetAtt AmplifyApp.AppId
+      EnableAutoBuild: true
+      Stage: PRODUCTION
+  
+###########################
+#### APPSYNC RESOURCES ####
+###########################
+  
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-GraphQLApi"
+      ApiType: GRAPHQL
+      AuthenticationType: AWS_LAMBDA
+      LambdaAuthorizerConfig:
+        AuthorizerUri: !GetAtt appSyncAuthFunction.Arn
+      AdditionalAuthenticationProviders:
+        - AuthenticationType: API_KEY
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt APIloggingRole.Arn
+        ExcludeVerboseContent: false
+        FieldLogLevel: ALL # Can be NONE, ERROR or ALL
+      Visibility: GLOBAL # Can be GLOBAL or PRIVATE
+      XrayEnabled: true
+  
+  GraphQLApiLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/appsync/apis/', !GetAtt GraphQLApi.ApiId]]
+  
+  GraphQLApiSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties: 
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition:
+        !Sub |
+          type Channel {
+            channelName: String!
+              @aws_lambda
+              @aws_api_key
+            data: String!
+              @aws_lambda
+              @aws_api_key
+          }
+          
+          type Mutation {
+            publishMessage(channelName: String!, data: String!): Channel
+              @aws_lambda
+              @aws_api_key
+          }
+          
+          type Query {
+            getChannel: Channel
+          }
+          
+          type Subscription {
+            subscribe(channelName: String!): Channel
+              @aws_subscribe(mutations: ["publishMessage"])
+          }
+  
+  GraphQLApiDomain:
+    Type: AWS::AppSync::DomainName
+    Condition: IsDomainConfigured
+    Properties:
+      DomainName: !If [IsSubDomainConfigured, !Sub "api-${DomainPrefix}.${Domain}", !Sub "api.Domain"]
+      CertificateArn: !Ref DomainCert
+  
+  GraphQLApiDomainAssociation:
+    Type: AWS::AppSync::DomainNameApiAssociation
+    Condition: IsDomainConfigured
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DomainName: !GetAtt GraphQLApiDomain.DomainName
+  
+  GraphQLApiDomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsDomainConfigured
+    Properties:
+      Name: !If [IsSubDomainConfigured, !Sub "api-${DomainPrefix}.${Domain}", !Sub "api.Domain"]
+      HostedZoneId: !Ref hostedZoneId
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt GraphQLApiDomain.AppSyncDomainName
+        EvaluateTargetHealth: true
+        HostedZoneId: Z2FDTNDATAQYW2 # always the value for cloudfront
+  
+  NoneDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      Name: NoneDataSource # [_A-Za-z][_0-9A-Za-z]*
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Type: NONE
+  
+  PublishResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      DataSourceName: !GetAtt NoneDataSource.Name
+      TypeName: Mutation
+      FieldName: publishMessage
+      RequestMappingTemplate: |
+        {
+            "version": "2017-02-28",
+            "payload": {
+                "channelName": "$context.arguments.channelName",
+                "data": "$context.arguments.data"
+            }
+        }
+      ResponseMappingTemplate: |
+        $util.toJson($context.result)
+    DependsOn:
+      - GraphQLApiSchema
+  
+#########
+## WAF ##
+#########
+  
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: IsWafConfigured
+    Properties:
+      Name: !Sub "${AWS::StackName}-WebACL"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {} # Allows requests by default
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-WebACL"
+      Rules:
+        - Name: AWS-AWSManagedRulesAmazonIpReputationList
+          Priority: 0
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWS-AWSManagedRulesAmazonIpReputationList
+          Statement:
+            ManagedRuleGroupStatement: 
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+  
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: IsWafConfigured
+    Properties:
+      WebACLArn: !GetAtt WebACL.Arn
+      ResourceArn: !GetAtt GraphQLApi.Arn
+  
+#############################
+### APPSYNC AUTH FUNCTION ###
+#############################
+  
+  appSyncAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-api-authorizer"
+      Role: !GetAtt lambdaRole.Arn
+      Handler: appSyncAuthFunction.handler
+      CodeUri: ./src/function
+      LoggingConfig:
+        LogFormat: JSON
+  
+  appSyncAuthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['', ['/aws/lambda/', !Ref appSyncAuthFunction]]
+  
+  appSyncAuthFunctionEBPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt appSyncAuthFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: appsync.amazonaws.com
+      SourceArn: !Ref GraphQLApi
+  
+Outputs:
+  AmplifyAppId: # do not change name
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyAppBranchName: # do not change name
+    Value: !GetAtt AmplifyBranch.BranchName
+  AppName:
+    Value: !GetAtt AmplifyApp.AppName
+  DefaultDomain:
+    Value: !GetAtt AmplifyApp.DefaultDomain
+  Domain:
+    Value: !If [IsSubDomainConfigured, !Sub "${DomainPrefix}.${Domain}", !If [IsDomainConfigured, !Sub "${Domain}", !GetAtt AmplifyApp.DefaultDomain]]
+  GraphQLApiApiId:
+    Value: !GetAtt GraphQLApi.ApiId
+  GraphQLApiArn:
+    Value: !GetAtt GraphQLApi.Arn
+  GraphQLApiGraphQLDns:
+    Value: !GetAtt GraphQLApi.GraphQLDns
+  GraphQLApiGraphQLUrl:
+    Value: !GetAtt GraphQLApi.GraphQLUrl
+  GraphQLApiRealtimeDns:
+    Value: !GetAtt GraphQLApi.RealtimeDns
+  GraphQLApiRealtimeUrl:
+    Value: !GetAtt GraphQLApi.RealtimeUrl

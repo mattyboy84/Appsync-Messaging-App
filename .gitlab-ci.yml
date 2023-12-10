@@ -1,0 +1,75 @@
+#image: amazon/aws-sam-cli-build-image-nodejs14.x:latest
+image: public.ecr.aws/sam/build-nodejs18.x:latest
+
+stages:
+  - deploy
+  - update-frontend
+  
+variables:
+  STACK_NAME: appsync-chat-app
+  STACK_REGION: eu-west-2
+  REPO_ID: $CI_PROJECT_ID
+  PROD_REPO_BRANCH: main
+  REPO_TOKEN: $AMPLIFY_TOKEN # CICD token variable that allows read repository on the chosen project id
+
+backend:
+  stage: deploy
+  script:
+    # use the REPO_ID to get the repo's path_with_namespace. e.g. 'groupA/groupB/reponame' this is overriden to CF Template
+    - >
+      REPO_URL=https://gitlab.com/$(curl --request GET --header "PRIVATE-TOKEN: ${REPO_TOKEN}" "https://gitlab.com/api/v4/projects/$REPO_ID" | jq -r '.path_with_namespace')
+    - echo $REPO_URL
+    #
+    - sam build
+    - sam package --output-template-file packaged.yaml --s3-bucket $S3_DEPLOY_BUCKET --region $STACK_REGION
+    # domain
+    - sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $STACK_REGION --parameter-overrides AmplifyAppRepoURL=$REPO_URL AmplifyAppRepoToken=$REPO_TOKEN AmplifyAppRepoBranch=$PROD_REPO_BRANCH Domain=$ROUTE_53_DOMAIN DomainCert=$ROUTE_53_DOMAIN_CERT_US_EAST_1 hostedZoneId=$ROUTE_53_DOMAIN_ID
+    # no domain
+    #- sam deploy --no-fail-on-empty-changeset --template-file packaged.yaml --stack-name $STACK_NAME --s3-bucket $S3_DEPLOY_BUCKET --capabilities CAPABILITY_NAMED_IAM --region $STACK_REGION --parameter-overrides AmplifyAppRepoURL=$REPO_URL AmplifyAppRepoToken=$REPO_TOKEN AmplifyAppRepoBranch=$PROD_REPO_BRANCH
+    # the amplify app will create a webhook that runs on every commit - we don't want that, we want to control when it runs
+    # deleting the amplify made webhook if its present.
+    - >
+      WEBHOOK_ID=$(curl --request GET --header "PRIVATE-TOKEN: ${REPO_TOKEN}" "https://gitlab.com/api/v4/projects/$REPO_ID/hooks" | jq -r '.[0].id')
+    - >
+      if [ -n "$WEBHOOK_ID" ]; then curl --request DELETE --header "PRIVATE-TOKEN: ${REPO_TOKEN}" "https://gitlab.com/api/v4/projects/$REPO_ID/hooks/$WEBHOOK_ID"; fi
+  only:
+    - main
+  
+update-frontend:
+  stage: update-frontend
+  script:
+    # get the app id & branch name then telling amplify to build from most recent commit
+    - AMPLIFY_APP_ID=$(aws cloudformation --region $STACK_REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppId'].OutputValue" --output text)
+    - AMPLIFY_BRANCH_NAME=$(aws cloudformation --region $STACK_REGION describe-stacks --stack-name $STACK_NAME --query "Stacks[0].Outputs[?OutputKey=='AmplifyAppBranchName'].OutputValue" --output text)
+    ###
+    - JOB_ID=$(aws amplify start-job --app-id ${AMPLIFY_APP_ID} --branch-name ${AMPLIFY_BRANCH_NAME} --job-type RELEASE | jq -r '.jobSummary.jobId')
+    - echo $JOB_ID
+    ##
+    - JOB_STATUS=$(aws amplify get-job --job-id ${JOB_ID} --app-id $AMPLIFY_APP_ID --branch-name ${AMPLIFY_BRANCH_NAME} | jq -r '.job.summary.status')
+    - echo $JOB_STATUS
+    ##
+    - >
+      while [[ "$JOB_STATUS" = "PENDING" || "$JOB_STATUS" = "RUNNING" ]];
+      do
+        sleep 10
+        JOB_STATUS=$(aws amplify get-job --job-id ${JOB_ID} --app-id $AMPLIFY_APP_ID --branch-name ${AMPLIFY_BRANCH_NAME} | jq -r '.job.summary.status')
+        echo $JOB_STATUS
+      done
+    - >
+      if [[ "$JOB_STATUS" = "SUCCEED" ]];
+      then
+        ARTIFACTS_URL=$(aws amplify get-job --job-id ${JOB_ID} --app-id $AMPLIFY_APP_ID --branch-name ${AMPLIFY_BRANCH_NAME} | jq -r '.job.steps[0].artifactsUrl')
+        echo $ARTIFACTS_URL
+        curl -o artifacts.zip "$ARTIFACTS_URL"
+      fi
+    - >
+      if [[ "$JOB_STATUS" = "FAILED" ]];
+      then
+        exit 0;
+      fi
+  when: manual
+  artifacts:
+    paths:
+      - artifacts.zip
+  only:
+    - main
